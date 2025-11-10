@@ -1,37 +1,3 @@
-name: Monitor Eventim F1 (Telegram)
-
-on:
-  schedule:
-    - cron: "*/5 * * * *"   # roda a cada 5 minutos
-  workflow_dispatch:
-    inputs:
-      force_notify:
-        description: "Enviar notificação de teste agora?"
-        required: false
-        default: "false"
-
-permissions:
-  contents: write   # permite commitar o state para evitar spam
-
-jobs:
-  check:
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-
-      - name: Install deps (Playwright + Requests)
-        run: |
-          python -m pip install --upgrade pip
-          pip install playwright requests
-          python -m playwright install --with-deps
-
       - name: Run monitor (detect button enabled/text)
         id: monitor
         env:
@@ -39,35 +5,90 @@ jobs:
           CHAT_ID: ${{ secrets.CHAT_ID }}
           FORCE_NOTIFY: ${{ github.event.inputs.force_notify }}
         run: |
-          cat > monitor.py << 'PY'
-          import asyncio, os, re, requests, pathlib
+          set -e
+          python - << 'PY'
+          import asyncio, os, re, requests, time
           from playwright.async_api import async_playwright
 
           URL = "https://www.eventim.com.br/campaign/f1saopaulo"
-          STATE_FILE = pathlib.Path("state_eventim.txt")
           TARGET_WORDS = [r"comprar", r"buy", r"ticket", r"tickets"]
 
           BOT_TOKEN = os.environ["BOT_TOKEN"]
           CHAT_ID   = os.environ["CHAT_ID"]
           FORCE     = (os.environ.get("FORCE_NOTIFY","false").lower() == "true")
 
-          async def detect():
+          UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
+
+          def gh_set_output(key, val):
+            with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as out:
+              print(f"{key}={val}", file=out)
+
+          def simple_parse(html: str) -> bool:
+            return any(re.search(pat, html, flags=re.I) for pat in TARGET_WORDS)
+
+          def fallback_requests() -> bool:
+            try:
+              r = requests.get(
+                URL,
+                headers={
+                  "User-Agent": UA,
+                  "Accept-Language": "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7",
+                  "Cache-Control": "no-cache",
+                },
+                timeout=30,
+                allow_redirects=True,
+              )
+              if r.status_code == 200 and r.text:
+                return simple_parse(r.text)
+            except Exception:
+              pass
+            return False
+
+          async def detect_playwright() -> bool:
+            # tenta com playwright, mas com ajustes anti HTTP/2 e UA real
             async with async_playwright() as p:
-              browser = await p.chromium.launch(headless=True)
-              page = await browser.new_page()
-              await page.goto(URL, wait_until="networkidle", timeout=120_000)
+              browser = await p.chromium.launch(
+                headless=True,
+                args=[
+                  "--disable-http2",           # evita ERR_HTTP2_PROTOCOL_ERROR
+                  "--no-sandbox",
+                  "--disable-dev-shm-usage",
+                ],
+              )
+              context = await browser.new_context(
+                user_agent=UA,
+                locale="pt-BR",
+                extra_http_headers={"Accept-Language": "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7"},
+                ignore_https_errors=True,
+                viewport={"width": 1366, "height": 768},
+              )
+              page = await context.new_page()
 
-              # 1) Procura textos típicos
+              # 1ª tentativa: DOMContentLoaded
+              try:
+                await page.goto(URL, wait_until="domcontentloaded", timeout=90_000)
+              except Exception:
+                await browser.close()
+                return False
+
+              # tenta atingir networkidle, mas sem quebrar se não der
+              try:
+                await page.wait_for_load_state("networkidle", timeout=20_000)
+              except Exception:
+                pass
+
               html = await page.content()
-              has_text = any(re.search(pat, html, flags=re.I) for pat in TARGET_WORDS)
+              has_text = simple_parse(html)
 
-              # 2) Procura botões/links habilitados
+              # heurística de botão habilitado
               enabled = False
               for sel in ["button", "a[role=button]", "a"]:
-                for el in await page.locator(sel).all():
+                els = await page.locator(sel).all()
+                for el in els:
                   try:
                     txt = (await el.inner_text()).strip().lower()
-                  except:
+                  except Exception:
                     continue
                   if any(w in txt for w in ["comprar","buy","ticket","tickets"]):
                     disabled = await el.get_attribute("disabled")
@@ -76,63 +97,24 @@ jobs:
                     if (disabled is None) and (aria in [None,"false"]) and ("disabled" not in classes):
                       enabled = True
                       break
-                if enabled: break
+                if enabled:
+                  break
 
               await browser.close()
               return has_text or enabled
 
-          def read_prev_state():
-            if STATE_FILE.exists():
-              return (STATE_FILE.read_text(encoding="utf-8").strip() or "OFF")
-            return "OFF"
-
-          def write_state(value: str):
-            STATE_FILE.write_text(value, encoding="utf-8")
-
           async def main():
             if FORCE:
-              # Força notificação para teste
-              print("should_notify=true")  # para debug de logs
-              with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as out:
-                print("prev_state=TEST", file=out)
-                print("curr_state=TEST", file=out)
-                print("should_notify=true", file=out)
+              gh_set_output("should_notify", "true")
               return
 
-            is_on = await detect()
-            prev  = read_prev_state()
-            now   = "ON" if is_on else "OFF"
+            # Tenta Playwright; se der erro de navegação, cai no fallback requests
+            try:
+              is_on = await detect_playwright()
+            except Exception:
+              is_on = fallback_requests()
 
-            with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as out:
-              print(f"prev_state={prev}", file=out)
-              print(f"curr_state={now}", file=out)
-              print(f"should_notify={'true' if (prev != now and now=='ON') else 'false'}", file=out)
-
-            write_state(now)
+            gh_set_output("should_notify", "true" if is_on else "false")
 
           asyncio.run(main())
           PY
-
-          python monitor.py
-
-      - name: Commit state change (avoid spam)
-        if: always()
-        run: |
-          if git status --porcelain | grep -q "state_eventim.txt"; then
-            git config user.name  "gh-actions"
-            git config user.email "actions@github.com"
-            git add state_eventim.txt
-            git commit -m "update state_eventim.txt"
-            git push
-          fi
-
-      - name: Send Telegram notification
-        if: steps.monitor.outputs.should_notify == 'true'
-        env:
-          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
-          CHAT_ID: ${{ secrets.CHAT_ID }}
-        run: |
-          TEXT="🔔 F1 Eventim: botão COMPRAR pode estar ATIVO!\nhttps://www.eventim.com.br/campaign/f1saopaulo"
-          curl -s --get "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
-            --data-urlencode "chat_id=${CHAT_ID}" \
-            --data-urlencode "text=${TEXT}"
