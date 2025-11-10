@@ -1,0 +1,62 @@
+name: Monitor Eventim F1 (Simple)
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"   # a cada 5 min
+  workflow_dispatch:        # permite rodar manualmente
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Check page with Requests (HTTP/1.1 only)
+        id: monitor
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          CHAT_ID: ${{ secrets.CHAT_ID }}
+        run: |
+          python - << 'PY'
+          import os, re, sys, requests
+
+          URL = "https://www.eventim.com.br/campaign/f1saopaulo"
+          TARGET = re.compile(r"(comprar|buy|ticket|tickets)", re.I)
+
+          UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
+
+          try:
+            r = requests.get(
+              URL,
+              headers={
+                "User-Agent": UA,
+                "Accept-Language": "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7",
+                "Cache-Control": "no-cache",
+                # Requests usa HTTP/1.1 por padrão – evita bugs de HTTP/2 do Playwright
+              },
+              timeout=30,
+              allow_redirects=True,
+            )
+            ok = (r.status_code == 200) and bool(TARGET.search(r.text or ""))
+          except Exception as e:
+            print(f"[monitor] erro requests: {e}", file=sys.stderr)
+            ok = False
+
+          # Notifica SEMPRE que detectar (como você pediu na opção 2)
+          should = "true" if ok else "false"
+
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as out:
+            out.write(f"should_notify={should}\n")
+          PY
+
+      - name: Send Telegram notification
+        if: steps.monitor.outputs.should_notify == 'true'
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          CHAT_ID: ${{ secrets.CHAT_ID }}
+        run: |
+          TEXT="🔔 F1 Eventim (simple): botão COMPRAR/TICKETS detectado!\nhttps://www.eventim.com.br/campaign/f1saopaulo"
+          curl -sS --get "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
+            --data-urlencode "chat_id=${CHAT_ID}" \
+            --data-urlencode "text=${TEXT}"
